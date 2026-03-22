@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "trialV5",
-    "project_version":    "786656b-dirty",
+    "project_version":    "7908579-dirty",
     "project_path":       "C:/PIO/trialV5",
     "idf_path":           "C:/esp/v5.5.3/esp-idf",
     "build_dir":          "C:/PIO/trialV5/build",
@@ -1331,7 +1331,7 @@
             "managed_priv_reqs": [],
             "file": "C:/PIO/trialV5/build/esp-idf/orchestra_ble/liborchestra_ble.a",
             "sources": [ "C:/PIO/trialV5/components/orchestra_ble/simple_BLE.cpp", "C:/PIO/trialV5/components/orchestra_ble/orchestra_payload.cpp" ],
-            "include_dirs": [ "include" ]
+            "include_dirs": [ "include", "../../include" ]
         },
         "partition_table": {
             "alias": "idf::partition_table",
@@ -2938,7 +2938,7 @@
             "priv_reqs": [],
             "managed_reqs": [],
             "managed_priv_reqs": [],
-            "include_dirs": [ "include" ]
+            "include_dirs": [ "include", "../../include" ]
         }
     },
     "debug_prefix_map_gdbinit": "",

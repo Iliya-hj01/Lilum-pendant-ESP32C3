@@ -9,6 +9,7 @@ idf_component_register(
     "sketch.cpp"
   INCLUDE_DIRS
     "."
+    "../include"
   REQUIRES
     orchestra_ble
 )

@@ -4,6 +4,7 @@ idf_component_register(
         "orchestra_payload.cpp"
     INCLUDE_DIRS
         "include"
+        "../../include"
     REQUIRES
         bt
 )
