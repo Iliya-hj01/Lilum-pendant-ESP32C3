@@ -1,0 +1,48 @@
+﻿Processing seeed_xiao_esp32c3 (platform: espressif32; board: seeed_xiao_esp32c3; framework: espidf, arduino)
+--------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/seeed_xiao_esp32c3.html
+PLATFORM: Espressif 32 (6.13.0) > Seeed Studio XIAO ESP32C3
+HARDWARE: ESP32C3 160MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-builtin, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20017.241212+sha.dcc1105b 
+ - framework-espidf @ 3.40407.240606 (4.4.7) 
+ - tool-cmake @ 3.30.2 
+ - tool-esp-rom-elfs @ 0.0.1+20241011 
+ - tool-esptoolpy @ 2.41100.0 (4.11.0) 
+ - tool-idf @ 1.0.1 
+ - tool-mconf @ 1.4060000.20190628 (406.0.0) 
+ - tool-ninja @ 1.9.0 
+ - toolchain-esp32ulp @ 1.23800.240113 (2.38.0) 
+ - toolchain-riscv32-esp @ 8.4.0+2021r2-patch5
+Warning! Arduino framework as an ESP-IDF component doesn't handle the `variant` field! The default `esp32` variant will be used.
+Reading CMake configuration...
+Warning! Flash memory size mismatch detected. Expected 4MB, found 2MB!
+Please select a proper value in your `sdkconfig.defaults` or via the `menuconfig` target!
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 34 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- FastLED @ 3.10.3
+Building in release mode
+Compiling .pio\build\seeed_xiao_esp32c3\src\main.cpp.o
+Compiling .pio\build\seeed_xiao_esp32c3\lib402\FastLED\power_mgt.cpp.o
+Compiling .pio\build\seeed_xiao_esp32c3\lib402\FastLED\sensors\digital_pin.cpp.o
+Compiling .pio\build\seeed_xiao_esp32c3\lib402\FastLED\sensors\pir.cpp.o
+Compiling .pio\build\seeed_xiao_esp32c3\lib402\FastLED\simplex.cpp.o
+Compiling .pio\build\seeed_xiao_esp32c3\lib402\FastLED\wiring.cpp.o
+Archiving .pio\build\seeed_xiao_esp32c3\lib402\libFastLED.a
+Linking .pio\build\seeed_xiao_esp32c3\firmware.elf
+Retrieving maximum program size .pio\build\seeed_xiao_esp32c3\firmware.elf
+Checking size .pio\build\seeed_xiao_esp32c3\firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [          ]   4.1% (used 13472 bytes from 327680 bytes)
+Flash: [===       ]  34.2% (used 358550 bytes from 1048576 bytes)
+Building .pio\build\seeed_xiao_esp32c3\firmware.bin
+esptool.py v4.11.0
+Creating esp32c3 image...
+Merged 2 ELF sections
+Successfully created esp32c3 image.
+========================= [SUCCESS] Took 21.18 seconds =========================

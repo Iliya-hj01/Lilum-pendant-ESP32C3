@@ -1,0 +1,103 @@
+﻿Processing seeed_xiao_esp32c3 (platform: espressif32; board: seeed_xiao_esp32c3; framework: espidf, arduino; lib_deps: fastled/FastLED; monitor_speed: 115200)
+--------------------------------------------------------------------------------
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/seeed_xiao_esp32c3.html
+PLATFORM: Espressif 32 (6.13.0) > Seeed Studio XIAO ESP32C3
+HARDWARE: ESP32C3 160MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-builtin, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20017.241212+sha.dcc1105b 
+ - framework-espidf @ 3.40407.240606 (4.4.7) 
+ - tool-cmake @ 3.30.2 
+ - tool-esp-rom-elfs @ 0.0.1+20241011 
+ - tool-esptoolpy @ 2.41100.0 (4.11.0) 
+ - tool-idf @ 1.0.1 
+ - tool-mconf @ 1.4060000.20190628 (406.0.0) 
+ - tool-ninja @ 1.9.0 
+ - toolchain-esp32ulp @ 1.23800.240113 (2.38.0) 
+ - toolchain-riscv32-esp @ 8.4.0+2021r2-patch5
+Warning! Arduino framework as an ESP-IDF component doesn't handle the `variant` field! The default `esp32` variant will be used.
+Reading CMake configuration...
+Warning! Flash memory size mismatch detected. Expected 4MB, found 2MB!
+Please select a proper value in your `sdkconfig.defaults` or via the `menuconfig` target!
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 34 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- FastLED @ 3.10.3 (License: MIT, Path: C:\PIO\trialV5\.pio\libdeps\seeed_xiao_esp32c3\FastLED)
+|   |-- SPI @ 2.0.0 (License: Unknown, Path: C:\Users\IliyaSlavkin\.platformio\packages\framework-arduinoespressif32\libraries\SPI)
+|   |-- I2S @ 1.0 (License: Unknown, Path: C:\Users\IliyaSlavkin\.platformio\packages\framework-arduinoespressif32\libraries\I2S)
+|   |-- FS @ 2.0.0 (License: Unknown, Path: C:\Users\IliyaSlavkin\.platformio\packages\framework-arduinoespressif32\libraries\FS)
+|   |-- SD @ 2.0.0 (License: Unknown, Path: C:\Users\IliyaSlavkin\.platformio\packages\framework-arduinoespressif32\libraries\SD)
+|   |   |-- FS @ 2.0.0 (License: Unknown, Path: C:\Users\IliyaSlavkin\.platformio\packages\framework-arduinoespressif32\libraries\FS)
+|   |   |-- SPI @ 2.0.0 (License: Unknown, Path: C:\Users\IliyaSlavkin\.platformio\packages\framework-arduinoespressif32\libraries\SPI)
+Building in release mode
+<lambda>(["checkprogsize"], [".pio\build\seeed_xiao_esp32c3\firmware.elf"])
+MethodWrapper(["checkprogsize"], [".pio\build\seeed_xiao_esp32c3\firmware.elf"])
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [          ]   4.1% (used 13472 bytes from 327680 bytes)
+Flash: [===       ]  34.2% (used 358550 bytes from 1048576 bytes)
+.pio\build\seeed_xiao_esp32c3\firmware.elf  :
+
+section                   size         addr
+
+.rtc.text                   16   1342177280
+
+.rtc.force_fast              0   1342177296
+
+.rtc_noinit                 16   1342177296
+
+.rtc.force_slow              0   1342177312
+
+.iram0.text              52782   1077411840
+
+.dram0.dummy             53248   1070071808
+
+.dram0.data               3992   1070125056
+
+.noinit                      0   1070129048
+
+.dram0.bss                9480   1070129056
+
+.flash.text             250712   1107296288
+
+.flash_rodata_dummy     262144   1006632992
+
+.flash.appdesc             256   1006895136
+
+.flash.rodata            51064   1006895392
+
+.eh_frame                 1944   1006946456
+
+.flash.rodata_noload         0   1006948400
+
+.iram0.text_end            466   1077464622
+
+.iram0.data                  0   1077465088
+
+.iram0.bss                   0   1077465088
+
+.dram0.heap_start            8   1070138536
+
+.debug_info            4561650            0
+
+.debug_abbrev           336050            0
+
+.debug_loc              886895            0
+
+.debug_aranges           40336            0
+
+.debug_ranges            71424            0
+
+.debug_line            1595021            0
+
+.debug_str              588919            0
+
+.comment                    93            0
+
+.riscv.attributes           55            0
+
+.debug_frame            141064            0
+
+Total                  8907635
+========================= [SUCCESS] Took 12.91 seconds =========================
