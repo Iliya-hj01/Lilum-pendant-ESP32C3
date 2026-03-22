@@ -1,9 +1,12 @@
 #include "simple_BLE.h"
 
+#include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,21 +17,28 @@
 #include "esp_nimble_hci.h"
 
 #include "host/ble_hs.h"
+#include "host/ble_hs_adv.h"
 #include "host/ble_uuid.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
 
+#include "orchestra_config.h"
+#include "orchestra_payload.h"
 #include "sketch.h"   // should declare: extern volatile uint8_t g_animation_mode;
 
 static const char *TAG = "BLE";
-static const int BLE_STARTUP_ADV_MS = 60000;
-static const int BLE_CYCLE_OFF_MS = 38000;
-static const int BLE_CYCLE_ADV_MS = 2000;
+static constexpr uint32_t BLE_STARTUP_ADV_MS = ORCHESTRA_STARTUP_WINDOW_MS;
+static constexpr uint32_t BLE_CYCLE_OFF_MS = ORCHESTRA_CYCLE_OFF_MS;
+static constexpr uint32_t BLE_CYCLE_ADV_MS = ORCHESTRA_CYCLE_ADV_MS;
 static bool ble_initialized = false;
 static bool ble_advertising = false;
+static bool ble_scanning = false;
 static bool ble_connected = false;
 static bool ble_startup_cycle_complete = false;
+static bool follower_synced = false;
+static int64_t follower_master_offset_ms = 0;  // Local time minus master's timestamp.
+static TaskHandle_t follower_scan_task_handle = NULL;
 
 // Custom 128-bit UUIDs
 static const ble_uuid128_t svc_uuid = {
@@ -65,6 +75,11 @@ static void ble_app_on_reset(int reason); // Logs BLE host reset reasons for dia
 static void ble_host_task(void *param); // NimBLE host task entry point that runs the BLE host loop.
 static void ble_deinit(void); // Deinitializes the BLE host, port, and controller stack.
 static void ble_deinit_and_restart_task(void *param); // One-shot task that deinitializes BLE, waits, then reinitializes BLE. 
+static uint32_t ble_get_sync_timestamp_ms(void); // Monotonic timestamp used as the sync reference in advertising.
+static bool ble_is_sync_source(const OrchestraAdvPayload &payload); // Checks whether an advertisement came from the configured master.
+static void ble_apply_master_packet(const OrchestraAdvPayload &payload); // Updates follower sync and animation based on master packet.
+static void ble_follower_scan_scheduler_task(void *param); // Maintains scan windows aligned to the master's BLE timing.
+static void ble_start_scan_for_ms(uint32_t duration_ms); // Starts a passive BLE scan for the requested duration.
 
 static const struct ble_gatt_svc_def gatt_svcs[] = {
     {
@@ -82,6 +97,111 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     },
     {0} // end of services
 };
+
+static uint32_t ble_get_sync_timestamp_ms(void)
+{
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+}
+
+static bool ble_is_sync_source(const OrchestraAdvPayload &payload)
+{
+    const bool role_ok = payload.role == OrchestraRole::Master;
+    const bool group_ok = payload.group_id == ORCHESTRA_GROUP_ID;
+    const bool master_id_ok = payload.master_id == ORCHESTRA_MASTER_ID;
+    const bool device_ok = payload.device_id == ORCHESTRA_MASTER_ID;
+    return role_ok && group_ok && master_id_ok && device_ok;
+}
+
+static void ble_apply_master_packet(const OrchestraAdvPayload &payload)
+{
+    const uint32_t now_ms = ble_get_sync_timestamp_ms();
+    follower_master_offset_ms = static_cast<int64_t>(now_ms) - static_cast<int64_t>(payload.sync_timestamp_ms);
+
+    if (!follower_synced) {
+        follower_synced = true;
+        ESP_LOGI(TAG,
+                 "Follower synced to master device=%u group=%u master_ts=%lu local_ts=%lu",
+                 payload.device_id,
+                 payload.group_id,
+                 static_cast<unsigned long>(payload.sync_timestamp_ms),
+                 static_cast<unsigned long>(now_ms));
+    }
+
+    if (g_animation_mode != payload.animation_mode) {
+        g_animation_mode = payload.animation_mode;
+        ESP_LOGI(TAG, "Animation updated by master to mode=%u", g_animation_mode);
+    }
+}
+
+static void ble_start_scan_for_ms(uint32_t duration_ms)
+{
+    struct ble_gap_disc_params disc_params;
+    memset(&disc_params, 0, sizeof(disc_params));
+
+    disc_params.passive = 1;
+    disc_params.itvl = 0x0030;
+    disc_params.window = 0x0030;
+    disc_params.filter_duplicates = 1;
+
+    int32_t scan_duration = duration_ms > INT32_MAX ? INT32_MAX : static_cast<int32_t>(duration_ms);
+    int rc = ble_gap_disc(own_addr_type, scan_duration, &disc_params, ble_gap_event, NULL);
+    if (rc == 0) {
+        ble_scanning = true;
+        ESP_LOGI(TAG, "Follower scan started for %lu ms", static_cast<unsigned long>(duration_ms));
+        return;
+    }
+
+    if (rc == BLE_HS_EALREADY) {
+        return;
+    }
+
+    ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
+}
+
+static void ble_follower_scan_scheduler_task(void *param)
+{
+    (void)param;
+    ESP_LOGI(TAG, "Follower scan scheduler started");
+
+    while (true) {
+        if (!follower_synced) {
+            ble_start_scan_for_ms(ORCHESTRA_STARTUP_WINDOW_MS);
+            vTaskDelay(pdMS_TO_TICKS(ORCHESTRA_STARTUP_WINDOW_MS + 150));
+            if (!follower_synced) {
+                ESP_LOGW(TAG, "Follower startup scan ended without sync; retrying");
+            }
+            continue;
+        }
+
+        uint32_t now_ms = ble_get_sync_timestamp_ms();
+        int64_t estimated_master_ms_signed = static_cast<int64_t>(now_ms) - follower_master_offset_ms;
+        if (estimated_master_ms_signed < 0) {
+            estimated_master_ms_signed = 0;
+        }
+
+        uint32_t estimated_master_ms = static_cast<uint32_t>(estimated_master_ms_signed);
+        uint32_t until_on_ms = orchestra_ms_until_next_master_on_air(estimated_master_ms);
+        if (until_on_ms > ORCHESTRA_SYNC_GUARD_MS) {
+            vTaskDelay(pdMS_TO_TICKS(until_on_ms - ORCHESTRA_SYNC_GUARD_MS));
+        }
+
+        now_ms = ble_get_sync_timestamp_ms();
+        estimated_master_ms_signed = static_cast<int64_t>(now_ms) - follower_master_offset_ms;
+        if (estimated_master_ms_signed < 0) {
+            estimated_master_ms_signed = 0;
+        }
+        estimated_master_ms = static_cast<uint32_t>(estimated_master_ms_signed);
+
+        uint32_t on_remaining_ms = orchestra_master_on_air_remaining_ms(estimated_master_ms);
+        uint32_t scan_ms = on_remaining_ms + ORCHESTRA_SYNC_GUARD_MS;
+        if (scan_ms < 250) {
+            scan_ms = 250;
+        }
+
+        ble_start_scan_for_ms(scan_ms);
+        vTaskDelay(pdMS_TO_TICKS(scan_ms + 50));
+    }
+}
 
 static int mode_chr_access(uint16_t conn_handle,
                            uint16_t attr_handle,
@@ -108,6 +228,10 @@ static int mode_chr_access(uint16_t conn_handle,
         case BLE_GATT_ACCESS_OP_WRITE_CHR: {
             uint8_t new_mode = 0;
             uint16_t out_len = 0;
+
+            if (ORCHESTRA_ROLE != OrchestraRole::Master) {
+                return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+            }
 
             if (OS_MBUF_PKTLEN(ctxt->om) != 1) {
                 return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -136,25 +260,62 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
 
     switch (event->type) {
+        case BLE_GAP_EVENT_DISC: {
+            struct ble_hs_adv_fields adv_fields;
+            memset(&adv_fields, 0, sizeof(adv_fields));
+
+            int rc = ble_hs_adv_parse_fields(&adv_fields,
+                                             event->disc.data,
+                                             event->disc.length_data);
+            if (rc != 0 || !adv_fields.mfg_data || adv_fields.mfg_data_len == 0) {
+                return 0;
+            }
+
+            OrchestraAdvPayload payload;
+            if (!orchestra_decode_adv_payload(reinterpret_cast<const uint8_t *>(adv_fields.mfg_data),
+                                              adv_fields.mfg_data_len,
+                                              &payload)) {
+                return 0;
+            }
+
+            if (ble_is_sync_source(payload)) {
+                ble_apply_master_packet(payload);
+            }
+            return 0;
+        }
+
+        case BLE_GAP_EVENT_DISC_COMPLETE:
+            ble_scanning = false;
+            ESP_LOGI(TAG, "Follower scan completed");
+            return 0;
+
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 ble_connected = true;
                 ble_advertising = false;
                 ESP_LOGI(TAG, "BLE connected");
             } else {
-                ESP_LOGW(TAG, "BLE connect failed; restarting advertising");
-                ble_app_advertise();
+                if (ORCHESTRA_ROLE == OrchestraRole::Master) {
+                    ESP_LOGW(TAG, "BLE connect failed; restarting advertising");
+                    ble_app_advertise();
+                }
             }
             return 0;
 
         case BLE_GAP_EVENT_DISCONNECT:
             ble_connected = false;
             ESP_LOGI(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
-            ble_app_advertise();
+            if (ORCHESTRA_ROLE == OrchestraRole::Master) {
+                ble_app_advertise();
+            }
             return 0;
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
             ble_advertising = false;
+            if (ORCHESTRA_ROLE != OrchestraRole::Master) {
+                return 0;
+            }
+
             if (ble_connected) {
                 // A connection was made during the advertising window; stack stays up
                 ESP_LOGI(TAG, "Advertising complete (connection active)");
@@ -183,24 +344,63 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
 static void ble_app_advertise(void)
 {
+    if (ORCHESTRA_ROLE != OrchestraRole::Master) {
+        return;
+    }
+
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
+    struct ble_hs_adv_fields rsp_fields;
+    uint8_t orchestra_adv_data[ORCHESTRA_ADV_PAYLOAD_LEN] = {0};
+    uint32_t sync_timestamp_ms = ble_get_sync_timestamp_ms();
     int adv_duration_ms = ble_startup_cycle_complete ? BLE_CYCLE_ADV_MS : BLE_STARTUP_ADV_MS;
 
     memset(&fields, 0, sizeof(fields));
+    memset(&rsp_fields, 0, sizeof(rsp_fields));
 
-    // Advertise device name
+    // Keep primary ADV packet compact (31-byte limit); place the full name in scan response.
     const char *name = ble_svc_gap_device_name();
-    fields.name = (uint8_t *)name;
-    fields.name_len = (uint8_t)strlen(name);
-    fields.name_is_complete = 1;
+    static const char short_name[] = "Pend-01";
+    fields.name = (uint8_t *)short_name;
+    fields.name_len = (uint8_t)strlen(short_name);
+    fields.name_is_complete = 0;
+    rsp_fields.name = (uint8_t *)name;
+    rsp_fields.name_len = (uint8_t)strlen(name);
+    rsp_fields.name_is_complete = 1;
 
     // General discoverable + BLE only
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
+    OrchestraAdvPayload payload = {
+        .group_id = ORCHESTRA_GROUP_ID,
+        .device_id = ORCHESTRA_DEVICE_ID,
+        .role = ORCHESTRA_ROLE,
+        .position = ORCHESTRA_POSITION,
+        .master_id = ORCHESTRA_MASTER_ID,
+        .sync_timestamp_ms = sync_timestamp_ms,
+        .animation_mode = g_animation_mode,
+    };
+
+    size_t orchestra_adv_data_len = orchestra_encode_adv_payload(orchestra_adv_data,
+                                                                 sizeof(orchestra_adv_data),
+                                                                 payload);
+    if (orchestra_adv_data_len != ORCHESTRA_ADV_PAYLOAD_LEN) {
+        ESP_LOGE(TAG, "Failed to build orchestra advertising payload");
+        return;
+    }
+
+    fields.mfg_data = orchestra_adv_data;
+    fields.mfg_data_len = static_cast<uint8_t>(orchestra_adv_data_len);
+
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_adv_set_fields failed: %d", rc);
+        return;
+    }
+
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_rsp_set_fields failed: %d", rc);
         return;
     }
 
@@ -221,8 +421,15 @@ static void ble_app_advertise(void)
 
     ble_advertising = true;
     ESP_LOGI(TAG,
-             "Advertising started for %d ms",
-             adv_duration_ms);
+             "Advertising started for %d ms (group=%u device=%u role=%s position=%d master=%u ts_ms=%lu anim=%u)",
+             adv_duration_ms,
+             ORCHESTRA_GROUP_ID,
+             ORCHESTRA_DEVICE_ID,
+             orchestra_role_to_string(ORCHESTRA_ROLE),
+             ORCHESTRA_POSITION,
+             ORCHESTRA_MASTER_ID,
+             static_cast<unsigned long>(sync_timestamp_ms),
+             g_animation_mode);
 }
 
 static void ble_app_on_sync(void)
@@ -242,7 +449,26 @@ static void ble_app_on_sync(void)
                  addr_val[2], addr_val[1], addr_val[0]);
     }
 
-    ble_app_advertise();
+    if (ORCHESTRA_ROLE == OrchestraRole::Master) {
+        ble_app_advertise();
+        return;
+    }
+
+    if (!follower_scan_task_handle) {
+        BaseType_t task_ok = xTaskCreate(ble_follower_scan_scheduler_task,
+                                         "BLE Follow Scan",
+                                         4096,
+                                         NULL,
+                                         5,
+                                         &follower_scan_task_handle);
+        if (task_ok != pdPASS) {
+            follower_scan_task_handle = NULL;
+            ESP_LOGE(TAG, "Failed to create follower scan scheduler task");
+            return;
+        }
+    }
+
+    ESP_LOGI(TAG, "Follower mode active; waiting for master sync");
 }
 
 static void ble_app_on_reset(int reason)
