@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "simple_BLE.cpp"
+        "orchestra_payload.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bt
+)
