@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "trialV5",
-    "project_version":    "7908579-dirty",
+    "project_version":    "4d1968f-dirty",
     "project_path":       "C:/PIO/trialV5",
     "idf_path":           "C:/esp/v5.5.3/esp-idf",
     "build_dir":          "C:/PIO/trialV5/build",

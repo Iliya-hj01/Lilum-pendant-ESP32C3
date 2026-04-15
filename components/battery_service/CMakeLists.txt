@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "battery_service.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        driver
+        esp_adc_cal
+)

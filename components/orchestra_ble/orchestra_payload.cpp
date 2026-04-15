@@ -67,7 +67,7 @@ bool orchestra_decode_adv_payload(const uint8_t *buffer, size_t buffer_len, Orch
 }
 
 // Startup is treated as continuously on-air; after that the master alternates between
-// short advertising windows and longer off periods.
+// off periods and short advertising windows (off first, then on).
 bool orchestra_is_master_on_air(uint32_t master_time_ms)
 {
     if (master_time_ms < ORCHESTRA_STARTUP_WINDOW_MS) {
@@ -76,7 +76,7 @@ bool orchestra_is_master_on_air(uint32_t master_time_ms)
 
     const uint32_t periodic_ms = ORCHESTRA_CYCLE_ADV_MS + ORCHESTRA_CYCLE_OFF_MS;
     const uint32_t cycle_phase_ms = (master_time_ms - ORCHESTRA_STARTUP_WINDOW_MS) % periodic_ms;
-    return cycle_phase_ms < ORCHESTRA_CYCLE_ADV_MS;
+    return cycle_phase_ms >= ORCHESTRA_CYCLE_OFF_MS;
 }
 
 // Returns zero when already inside an advertising window, otherwise the delay until the
@@ -93,7 +93,7 @@ uint32_t orchestra_ms_until_next_master_on_air(uint32_t master_time_ms)
 
     const uint32_t periodic_ms = ORCHESTRA_CYCLE_ADV_MS + ORCHESTRA_CYCLE_OFF_MS;
     const uint32_t cycle_phase_ms = (master_time_ms - ORCHESTRA_STARTUP_WINDOW_MS) % periodic_ms;
-    return periodic_ms - cycle_phase_ms;
+    return ORCHESTRA_CYCLE_OFF_MS - cycle_phase_ms;
 }
 
 // Reports how much of the current advertising slot is left so followers can size their
@@ -110,5 +110,5 @@ uint32_t orchestra_master_on_air_remaining_ms(uint32_t master_time_ms)
 
     const uint32_t periodic_ms = ORCHESTRA_CYCLE_ADV_MS + ORCHESTRA_CYCLE_OFF_MS;
     const uint32_t cycle_phase_ms = (master_time_ms - ORCHESTRA_STARTUP_WINDOW_MS) % periodic_ms;
-    return ORCHESTRA_CYCLE_ADV_MS - cycle_phase_ms;
+    return periodic_ms - cycle_phase_ms;
 }

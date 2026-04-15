@@ -5,6 +5,7 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
         "../../include"
+        "../../lib/led_engine"
     REQUIRES
         bt
 )

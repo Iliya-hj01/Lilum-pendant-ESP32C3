@@ -1,3 +1,8 @@
+
+
+// Forward declaration for use in timer callback
+void orchestra_ble_deinit(void);
+
 #include "simple_BLE.h"
 
 #include <stdint.h>
@@ -11,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -25,8 +31,14 @@
 
 #include "orchestra_config.h"
 #include "orchestra_payload.h"
+#include "led_engine.h"
 
 static const char *TAG = "BLE";
+
+void ble_set_logging(bool enabled) {
+    esp_log_level_set(TAG, enabled ? ESP_LOG_INFO : ESP_LOG_NONE);
+}
+
 static constexpr uint32_t BLE_STARTUP_ADV_MS = ORCHESTRA_STARTUP_WINDOW_MS;
 static constexpr uint32_t BLE_CYCLE_OFF_MS = ORCHESTRA_CYCLE_OFF_MS;
 static constexpr uint32_t BLE_CYCLE_ADV_MS = ORCHESTRA_CYCLE_ADV_MS;
@@ -36,8 +48,72 @@ static bool ble_scanning = false;
 static bool ble_connected = false;
 static bool ble_startup_cycle_complete = false;
 static bool follower_synced = false;
+static bool follower_ever_synced = false;  // True once first sync is achieved.
 static int64_t follower_master_offset_ms = 0;  // Local time minus master's timestamp.
 static TaskHandle_t follower_scan_task_handle = NULL;
+static TaskHandle_t master_adv_refresh_task_handle = NULL;
+static uint32_t scan_adv_count = 0;  // Count of advertisements seen in current scan
+static uint8_t last_advertised_mode = 0;  // Track mode currently in the adv payload
+static bool master_heard_in_scan = false;  // Set when master packet received during a scan
+static uint8_t consecutive_missed_scans = 0;  // Count of consecutive scan windows without master
+static uint32_t last_master_heard_local_ms = 0;  // Follower local time when master was last received
+
+// GATT inactivity timer (master only)
+#define BLE_GATT_INACTIVITY_TIMEOUT_MS 300000UL
+static TimerHandle_t gatt_inactivity_timer = NULL;
+
+static void gatt_inactivity_timeout_cb(TimerHandle_t xTimer) {
+    ESP_LOGI(TAG, "GATT inactivity timeout reached, disconnecting and tearing down BLE stack");
+    if (ble_connected) {
+        ble_gap_terminate(0, BLE_ERR_REM_USER_CONN_TERM); // 0 = any connection
+    }
+    orchestra_ble_deinit();
+}
+
+static void gatt_inactivity_timer_reset() {
+    if (gatt_inactivity_timer) {
+        xTimerStop(gatt_inactivity_timer, 0);
+        xTimerChangePeriod(gatt_inactivity_timer, pdMS_TO_TICKS(BLE_GATT_INACTIVITY_TIMEOUT_MS), 0);
+        xTimerStart(gatt_inactivity_timer, 0);
+    }
+}
+
+// Advertising timeout timer – enforces the startup window independently of NimBLE,
+// because ble_gap_adv_set_fields() (called by the payload-refresh task) can
+// internally restart advertising and reset the NimBLE duration counter.
+static TimerHandle_t adv_timeout_timer = NULL;
+
+static void adv_timeout_cb(TimerHandle_t xTimer) {
+    (void)xTimer;
+    ESP_LOGI(TAG, "Advertising timeout timer fired");
+    ble_gap_adv_stop();
+    ble_advertising = false;
+    if (!ble_connected) {
+        ESP_LOGI(TAG, "No connection during advertising window; tearing down BLE permanently");
+        orchestra_ble_deinit();
+    }
+}
+
+bool ble_is_follower_synced(void)
+{
+    return follower_synced;
+}
+
+uint32_t ble_ms_until_next_scan(void)
+{
+    // Follower scans continuously; always return 0.
+    return 0;
+}
+
+bool ble_is_currently_advertising(void)
+{
+    return ble_advertising;
+}
+
+bool ble_is_currently_scanning(void)
+{
+    return ble_scanning;
+}
 
 // Animation mode is owned by sketch.cpp and shared with BLE.
 extern uint8_t g_animation_mode;
@@ -75,23 +151,28 @@ static int mode_chr_access(uint16_t conn_handle,
 static void ble_app_on_sync(void); // Runs when the BLE host is synchronized and ready to begin advertising.
 static void ble_app_on_reset(int reason); // Logs BLE host reset reasons for diagnostics.
 static void ble_host_task(void *param); // NimBLE host task entry point that runs the BLE host loop.
-static void ble_deinit(void); // Deinitializes the BLE host, port, and controller stack.
 static void ble_deinit_and_restart_task(void *param); // One-shot task that deinitializes BLE, waits, then reinitializes BLE.
 static uint32_t ble_get_sync_timestamp_ms(void); // Monotonic timestamp used as the sync reference in advertising.
 static bool ble_is_sync_source(const OrchestraAdvPayload &payload); // Checks whether an advertisement came from the configured master.
 static void ble_apply_master_packet(const OrchestraAdvPayload &payload); // Updates follower sync and animation based on master packet.
-static void ble_follower_scan_scheduler_task(void *param); // Maintains scan windows aligned to the master's BLE timing.
-static void ble_start_scan_for_ms(uint32_t duration_ms); // Starts a passive BLE scan for the requested duration.
+static void ble_follower_scan_scheduler_task(void *param); // Starts continuous BLE scanning for the follower.
+static void ble_start_continuous_scan(void); // Starts a continuous passive BLE scan (BLE_HS_FOREVER).
+static void ble_master_adv_refresh_task(void *param); // Refreshes adv payload when animation mode changes.
+static void ble_update_adv_payload(void); // Updates adv data in-place with current mode and timestamp.
 
 static const struct ble_gatt_svc_def gatt_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = &svc_uuid.u,
+        .includes = NULL,
         .characteristics = (struct ble_gatt_chr_def[]) {
             {
                 .uuid = &chr_uuid.u,
                 .access_cb = mode_chr_access,
+                .arg = NULL,
+                .descriptors = NULL,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+                .min_key_size = 0,
                 .val_handle = &mode_chr_handle,
             },
             {0} // end of characteristics
@@ -109,9 +190,8 @@ static bool ble_is_sync_source(const OrchestraAdvPayload &payload)
 {
     const bool role_ok = payload.role == OrchestraRole::Master;
     const bool group_ok = payload.group_id == ORCHESTRA_GROUP_ID;
-    const bool master_id_ok = payload.master_id == ORCHESTRA_MASTER_ID;
     const bool device_ok = payload.device_id == ORCHESTRA_MASTER_ID;
-    return role_ok && group_ok && master_id_ok && device_ok;
+    return role_ok && group_ok && device_ok;
 }
 
 static void ble_apply_master_packet(const OrchestraAdvPayload &payload)
@@ -121,13 +201,18 @@ static void ble_apply_master_packet(const OrchestraAdvPayload &payload)
 
     if (!follower_synced) {
         follower_synced = true;
+        follower_ever_synced = true;
         ESP_LOGI(TAG,
-                 "Follower synced to master device=%u group=%u master_ts=%lu local_ts=%lu",
+                 "Follower synced to master device=%u group=%u master_ts=%lu local_ts=%lu offset=%lld",
                  payload.device_id,
                  payload.group_id,
                  static_cast<unsigned long>(payload.sync_timestamp_ms),
-                 static_cast<unsigned long>(now_ms));
+                 static_cast<unsigned long>(now_ms),
+                 static_cast<long long>(follower_master_offset_ms));
     }
+
+    master_heard_in_scan = true;
+    last_master_heard_local_ms = now_ms;
 
     if (g_animation_mode != payload.animation_mode) {
         g_animation_mode = payload.animation_mode;
@@ -135,7 +220,10 @@ static void ble_apply_master_packet(const OrchestraAdvPayload &payload)
     }
 }
 
-static void ble_start_scan_for_ms(uint32_t duration_ms)
+// Starts a continuous passive scan (BLE_HS_FOREVER).
+// Called once at startup and re-called from BLE_GAP_EVENT_DISC_COMPLETE
+// if the scan ends for any reason.
+static void ble_start_continuous_scan(void)
 {
     struct ble_gap_disc_params disc_params;
     memset(&disc_params, 0, sizeof(disc_params));
@@ -143,65 +231,33 @@ static void ble_start_scan_for_ms(uint32_t duration_ms)
     disc_params.passive = 1;
     disc_params.itvl = 0x0030;
     disc_params.window = 0x0030;
-    disc_params.filter_duplicates = 1;
+    disc_params.filter_duplicates = 0;
 
-    int32_t scan_duration = duration_ms > INT32_MAX ? INT32_MAX : static_cast<int32_t>(duration_ms);
-    int rc = ble_gap_disc(own_addr_type, scan_duration, &disc_params, ble_gap_event, NULL);
+    int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
     if (rc == 0) {
         ble_scanning = true;
-        ESP_LOGI(TAG, "Follower scan started for %lu ms", static_cast<unsigned long>(duration_ms));
+        ESP_LOGI(TAG, "Continuous follower scan ACTIVE");
         return;
     }
-
     if (rc == BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "Scan already active (BLE_HS_EALREADY)");
         return;
     }
-
-    ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
+    ESP_LOGE(TAG, "ble_gap_disc FAILED: rc=%d", rc);
 }
 
 static void ble_follower_scan_scheduler_task(void *param)
 {
     (void)param;
-    ESP_LOGI(TAG, "Follower scan scheduler started");
+    ESP_LOGI(TAG, ">>> FOLLOWER CONTINUOUS SCAN TASK STARTED <<<");
+    vTaskDelay(pdMS_TO_TICKS(100));  // Let BLE host fully initialize
 
+    ble_start_continuous_scan();
+
+    // Task stays alive so the handle remains valid, but has nothing else to do.
+    // The scan restarts from BLE_GAP_EVENT_DISC_COMPLETE if it ever stops.
     while (true) {
-        if (!follower_synced) {
-            ble_start_scan_for_ms(ORCHESTRA_STARTUP_WINDOW_MS);
-            vTaskDelay(pdMS_TO_TICKS(ORCHESTRA_STARTUP_WINDOW_MS + 150));
-            if (!follower_synced) {
-                ESP_LOGW(TAG, "Follower startup scan ended without sync; retrying");
-            }
-            continue;
-        }
-
-        uint32_t now_ms = ble_get_sync_timestamp_ms();
-        int64_t estimated_master_ms_signed = static_cast<int64_t>(now_ms) - follower_master_offset_ms;
-        if (estimated_master_ms_signed < 0) {
-            estimated_master_ms_signed = 0;
-        }
-
-        uint32_t estimated_master_ms = static_cast<uint32_t>(estimated_master_ms_signed);
-        uint32_t until_on_ms = orchestra_ms_until_next_master_on_air(estimated_master_ms);
-        if (until_on_ms > ORCHESTRA_SYNC_GUARD_MS) {
-            vTaskDelay(pdMS_TO_TICKS(until_on_ms - ORCHESTRA_SYNC_GUARD_MS));
-        }
-
-        now_ms = ble_get_sync_timestamp_ms();
-        estimated_master_ms_signed = static_cast<int64_t>(now_ms) - follower_master_offset_ms;
-        if (estimated_master_ms_signed < 0) {
-            estimated_master_ms_signed = 0;
-        }
-        estimated_master_ms = static_cast<uint32_t>(estimated_master_ms_signed);
-
-        uint32_t on_remaining_ms = orchestra_master_on_air_remaining_ms(estimated_master_ms);
-        uint32_t scan_ms = on_remaining_ms + ORCHESTRA_SYNC_GUARD_MS;
-        if (scan_ms < 250) {
-            scan_ms = 250;
-        }
-
-        ble_start_scan_for_ms(scan_ms);
-        vTaskDelay(pdMS_TO_TICKS(scan_ms + 50));
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
@@ -214,6 +270,8 @@ static int mode_chr_access(uint16_t conn_handle,
     (void)attr_handle;
     (void)arg;
 
+    // Reset inactivity timer on any GATT access
+    gatt_inactivity_timer_reset();
     switch (ctxt->op) {
         case BLE_GATT_ACCESS_OP_READ_CHR: {
             int rc = os_mbuf_append(ctxt->om,
@@ -266,6 +324,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             struct ble_hs_adv_fields adv_fields;
             memset(&adv_fields, 0, sizeof(adv_fields));
 
+            // Count all received advertisements
+            scan_adv_count++;
+            // Log non-orchestra advertisements at DEBUG level only
+            ESP_LOGD(TAG, "ADV RX (#%lu): addr=%02x:%02x:%02x:%02x:%02x:%02x rssi=%d len=%u",
+                     static_cast<unsigned long>(scan_adv_count),
+                     event->disc.addr.val[0], event->disc.addr.val[1],
+                     event->disc.addr.val[2], event->disc.addr.val[3],
+                     event->disc.addr.val[4], event->disc.addr.val[5],
+                     event->disc.rssi, event->disc.length_data);
+
             int rc = ble_hs_adv_parse_fields(&adv_fields,
                                              event->disc.data,
                                              event->disc.length_data);
@@ -281,14 +349,31 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             }
 
             if (ble_is_sync_source(payload)) {
+                if (!master_heard_in_scan) {
+                    ESP_LOGI(TAG, "Orchestra ADV (sync): dev=%u ts=%lu anim=%u",
+                             payload.device_id,
+                             static_cast<unsigned long>(payload.sync_timestamp_ms),
+                             payload.animation_mode);
+                }
                 ble_apply_master_packet(payload);
+            } else {
+                ESP_LOGD(TAG, "Orchestra ADV (other): role=%u group=%u dev=%u master=%u",
+                         static_cast<uint8_t>(payload.role), payload.group_id,
+                         payload.device_id, payload.master_id);
             }
             return 0;
         }
 
         case BLE_GAP_EVENT_DISC_COMPLETE:
             ble_scanning = false;
-            ESP_LOGI(TAG, "Follower scan completed");
+            ESP_LOGI(TAG, "Scan completed (adverts RX: %lu) — restarting continuous scan",
+                     static_cast<unsigned long>(scan_adv_count));
+            master_heard_in_scan = false;
+            scan_adv_count = 0;
+            // Immediately restart scanning so the follower never stops listening
+            if (ORCHESTRA_ROLE == OrchestraRole::Follower) {
+                ble_start_continuous_scan();
+            }
             return 0;
 
         case BLE_GAP_EVENT_CONNECT:
@@ -296,6 +381,11 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                 ble_connected = true;
                 ble_advertising = false;
                 ESP_LOGI(TAG, "BLE connected");
+                // Cancel advertising timeout – device is connected now
+                if (adv_timeout_timer) {
+                    xTimerStop(adv_timeout_timer, 0);
+                }
+                gatt_inactivity_timer_reset();
             } else {
                 if (ORCHESTRA_ROLE == OrchestraRole::Master) {
                     ESP_LOGW(TAG, "BLE connect failed; restarting advertising");
@@ -307,6 +397,9 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         case BLE_GAP_EVENT_DISCONNECT:
             ble_connected = false;
             ESP_LOGI(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
+            if (gatt_inactivity_timer) {
+                xTimerStop(gatt_inactivity_timer, 0);
+            }
             if (ORCHESTRA_ROLE == OrchestraRole::Master) {
                 ble_app_advertise();
             }
@@ -322,12 +415,10 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                 // A connection was made during the advertising window; stack stays up
                 ESP_LOGI(TAG, "Advertising complete (connection active)");
             } else {
-                if (!ble_startup_cycle_complete) {
-                    ble_startup_cycle_complete = true;
-                }
-                // Normal timeout - shut down the stack completely for 38 s
-                ESP_LOGI(TAG, "Advertising complete; tearing down BLE for 38 seconds");
-                xTaskCreate(ble_deinit_and_restart_task, "BLE Restart", 4096, NULL, 5, NULL);
+                // No connection was established during the advertising window.
+                // Tear down the BLE stack permanently to save power.
+                ESP_LOGI(TAG, "Advertising complete with no connection; tearing down BLE permanently");
+                orchestra_ble_deinit();
             }
             return 0;
 
@@ -344,6 +435,70 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
     }
 }
 
+// Updates the advertising payload with the current animation mode and timestamp
+// while the master is already advertising. Safe to call at any time.
+static void ble_update_adv_payload(void)
+{
+    if (!ble_initialized || !ble_advertising) {
+        return;
+    }
+
+    struct ble_hs_adv_fields fields;
+    uint8_t orchestra_adv_data[ORCHESTRA_ADV_PAYLOAD_LEN] = {0};
+    uint32_t sync_timestamp_ms = ble_get_sync_timestamp_ms();
+
+    memset(&fields, 0, sizeof(fields));
+
+    static const char short_name[] = "Pend-01";
+    fields.name = (uint8_t *)short_name;
+    fields.name_len = (uint8_t)strlen(short_name);
+    fields.name_is_complete = 0;
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+
+    OrchestraAdvPayload payload = {
+        .group_id = ORCHESTRA_GROUP_ID,
+        .device_id = ORCHESTRA_DEVICE_ID,
+        .role = ORCHESTRA_ROLE,
+        .position = ORCHESTRA_POSITION,
+        .master_id = ORCHESTRA_MASTER_ID,
+        .sync_timestamp_ms = sync_timestamp_ms,
+        .animation_mode = g_animation_mode,
+    };
+
+    size_t len = orchestra_encode_adv_payload(orchestra_adv_data, sizeof(orchestra_adv_data), payload);
+    if (len != ORCHESTRA_ADV_PAYLOAD_LEN) {
+        return;
+    }
+
+    fields.mfg_data = orchestra_adv_data;
+    fields.mfg_data_len = static_cast<uint8_t>(len);
+
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv payload refresh failed: %d", rc);
+        return;
+    }
+
+    last_advertised_mode = g_animation_mode;
+    ESP_LOGI(TAG, "Adv payload refreshed: anim=%u ts=%lu", g_animation_mode,
+             static_cast<unsigned long>(sync_timestamp_ms));
+}
+
+// Runs while the master is advertising; checks if animation mode changed
+// and refreshes the adv payload if so.
+static void ble_master_adv_refresh_task(void *param)
+{
+    (void)param;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (!ble_initialized || !ble_advertising) {
+            continue;
+        }
+        // Always refresh so the timestamp stays current for followers.
+        ble_update_adv_payload();
+    }
+}
+
 static void ble_app_advertise(void)
 {
     if (ORCHESTRA_ROLE != OrchestraRole::Master) {
@@ -356,6 +511,17 @@ static void ble_app_advertise(void)
     uint8_t orchestra_adv_data[ORCHESTRA_ADV_PAYLOAD_LEN] = {0};
     uint32_t sync_timestamp_ms = ble_get_sync_timestamp_ms();
     int adv_duration_ms = ble_startup_cycle_complete ? BLE_CYCLE_ADV_MS : BLE_STARTUP_ADV_MS;
+    // Use BLE_HS_FOREVER for NimBLE because the payload-refresh task calls
+    // ble_gap_adv_set_fields() every 500 ms which resets the NimBLE duration
+    // counter.  The actual timeout is enforced by adv_timeout_timer instead.
+    int nimble_duration = BLE_HS_FOREVER;
+
+    // Cycle animation mode at the start of each post-startup advertising window
+    // so the mode change is always visible to followers.
+    if (ble_startup_cycle_complete) {
+        g_animation_mode = (g_animation_mode + 1) % led_engine_get_num_auto_patterns();
+        ESP_LOGI(TAG, "Master animation mode cycled to %u", g_animation_mode);
+    }
 
     memset(&fields, 0, sizeof(fields));
     memset(&rsp_fields, 0, sizeof(rsp_fields));
@@ -412,7 +578,7 @@ static void ble_app_advertise(void)
 
     rc = ble_gap_adv_start(own_addr_type,
                            NULL,
-                           adv_duration_ms,
+                           nimble_duration,
                            &adv_params,
                            ble_gap_event,
                            NULL);
@@ -422,6 +588,15 @@ static void ble_app_advertise(void)
     }
 
     ble_advertising = true;
+    last_advertised_mode = g_animation_mode;
+
+    // Start (or restart) the software timer that enforces the advertising window
+    if (adv_timeout_timer) {
+        xTimerStop(adv_timeout_timer, 0);
+        xTimerChangePeriod(adv_timeout_timer, pdMS_TO_TICKS(adv_duration_ms), 0);
+        xTimerStart(adv_timeout_timer, 0);
+    }
+
     ESP_LOGI(TAG,
              "Advertising started for %d ms (group=%u device=%u role=%s position=%d master=%u ts_ms=%lu anim=%u)",
              adv_duration_ms,
@@ -436,6 +611,8 @@ static void ble_app_advertise(void)
 
 static void ble_app_on_sync(void)
 {
+    ESP_LOGI(TAG, ">>> BLE HOST SYNCHRONIZED <<<");
+    
     int rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_hs_id_infer_auto failed: %d", rc);
@@ -445,6 +622,14 @@ static void ble_app_on_sync(void)
     uint8_t addr_val[6] = {0};
     rc = ble_hs_id_copy_addr(own_addr_type, addr_val, NULL);
     if (rc == 0) {
+        // Create GATT inactivity timer (master only)
+        if (ORCHESTRA_ROLE == OrchestraRole::Master && !gatt_inactivity_timer) {
+            gatt_inactivity_timer = xTimerCreate("GATT Inactivity", pdMS_TO_TICKS(BLE_GATT_INACTIVITY_TIMEOUT_MS), pdFALSE, NULL, gatt_inactivity_timeout_cb);
+        }
+        // Create advertising timeout timer (master only)
+        if (ORCHESTRA_ROLE == OrchestraRole::Master && !adv_timeout_timer) {
+            adv_timeout_timer = xTimerCreate("Adv Timeout", pdMS_TO_TICKS(BLE_STARTUP_ADV_MS), pdFALSE, NULL, adv_timeout_cb);
+        }
         ESP_LOGI(TAG,
                  "BLE address: %02X:%02X:%02X:%02X:%02X:%02X",
                  addr_val[5], addr_val[4], addr_val[3],
@@ -453,6 +638,9 @@ static void ble_app_on_sync(void)
 
     if (ORCHESTRA_ROLE == OrchestraRole::Master) {
         ble_app_advertise();
+        if (!master_adv_refresh_task_handle) {
+            xTaskCreate(ble_master_adv_refresh_task, "BLE AdvRefresh", 3072, NULL, 4, &master_adv_refresh_task_handle);
+        }
         return;
     }
 
@@ -490,7 +678,7 @@ static void ble_host_task(void *param)
 }
 
 // Tears down the entire BLE stack. Must be called from a task that is NOT the NimBLE host task.
-static void ble_deinit(void)
+void orchestra_ble_deinit(void)
 {
     if (!ble_initialized) {
         ESP_LOGW(TAG, "ble_deinit called but BLE not initialised");
@@ -523,7 +711,7 @@ static void ble_deinit_and_restart_task(void *param)
 {
     (void)param;
     ESP_LOGI(TAG, "BLE off period: tearing down stack");
-    ble_deinit();
+    orchestra_ble_deinit();
 
     ESP_LOGI(TAG, "BLE sleeping for %d milliseconds", BLE_CYCLE_OFF_MS);
     vTaskDelay(pdMS_TO_TICKS(BLE_CYCLE_OFF_MS));
@@ -536,6 +724,8 @@ static void ble_deinit_and_restart_task(void *param)
 
 void ble_init(void)
 {
+    ESP_LOGI(TAG, ">>> ble_init() CALLED <<<");
+    
     if (ble_initialized) {
         ESP_LOGW(TAG, "ble_init called but BLE already initialised");
         return;
@@ -587,3 +777,4 @@ void ble_init(void)
     ble_initialized = true;
     ESP_LOGI(TAG, "BLE init complete");
 }
+
