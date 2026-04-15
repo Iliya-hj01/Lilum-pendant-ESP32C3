@@ -575,7 +575,6 @@ static void beacon() {
 // ---------------------------------------------------------------------------
 
 void led_engine_setup() {
-    delay(2000);
 
     pinMode(OUTPUT_PIN, OUTPUT);
     digitalWrite(OUTPUT_PIN, g_output_state ? HIGH : LOW);

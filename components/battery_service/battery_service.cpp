@@ -42,9 +42,14 @@ static const char *TAG = "BAT";
 #define KEY_DOUBLE_CLICK_BIT 0x04U
 
 // Bit masks – REG_SYS_CTL0
-#define BOOST_OUT_BIT       0x02U
-#define BOOST_BUTTON_EN_BIT 0x01U
-#define CHARGER_EN_BIT      0x10U   // bit 4 = charger on/off
+#define SYS_CTL0_BIT5      (1U << 5)  // boost mode enable
+#define SYS_CTL0_BIT2      (1U << 1)  // boost output enable
+#define SYS_CTL0_BIT3      (1U << 2)  // power on load
+#define CHARGER_EN_BIT      0x10U      // bit 4 = charger on/off
+
+// Bit masks – REG_SYS_CTL1
+#define SYS_CTL1_BIT8      (1U << 7)  // boost control signal
+#define SYS_CTL1_BIT5      (1U << 5)  // short press boost switch
 
 // Charging current: I_mA = (value × 100) + 50
 // 0.25 A = 250 mA → value = (250 − 50) / 100 = 2
@@ -109,6 +114,18 @@ static esp_err_t ip5306_write_reg(uint8_t reg, uint8_t val)
     return i2c_master_write_to_device(BAT_I2C_NUM, IP5306_ADDR,
                                       buf, sizeof(buf),
                                       pdMS_TO_TICKS(50));
+}
+
+static esp_err_t ip5306_updateBits(uint8_t reg, uint8_t mask, bool high)
+{
+    uint8_t data;
+    esp_err_t err = ip5306_read_reg(reg, &data);
+    if (err != ESP_OK) return err;
+    if (high)
+        data |= mask;
+    else
+        data &= ~mask;
+    return ip5306_write_reg(reg, data);
 }
 
 // ── IP5306 read helpers ────────────────────────────────────
@@ -213,13 +230,14 @@ static void ip5306_set_charge_current(void)
 
 static void ip5306_configure(void)
 {
-    uint8_t data;
+    // SYS_CTL0
+    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT5, true);  // enable boost mode
+    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT2, true);  // enable boost output
+    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT3, false); // disable power on load
 
-    // SYS_CTL0: enable boost output, enable power button
-    if (ip5306_read_reg(IP5306_REG_SYS_CTL0, &data) == ESP_OK) {
-        data |= BOOST_OUT_BIT | BOOST_BUTTON_EN_BIT;
-        ip5306_write_reg(IP5306_REG_SYS_CTL0, data);
-    }
+    // SYS_CTL1
+    ip5306_updateBits(IP5306_REG_SYS_CTL1, SYS_CTL1_BIT8, false); // disable boost control signal
+    ip5306_updateBits(IP5306_REG_SYS_CTL1, SYS_CTL1_BIT5, true);  // enable short press boost
 
     // Set charging current to 0.25 A
     ip5306_set_charge_current();
@@ -289,19 +307,13 @@ static void battery_task(void *arg)
             bool out_of_range = (t < CHG_TEMP_MIN_C) || (t > CHG_TEMP_MAX_C);
             if (out_of_range && !s_chg_inhibited) {
                 // Disable charger
-                uint8_t ctl0;
-                if (ip5306_read_reg(IP5306_REG_SYS_CTL0, &ctl0) == ESP_OK) {
-                    ip5306_write_reg(IP5306_REG_SYS_CTL0, ctl0 & ~CHARGER_EN_BIT);
-                }
+                ip5306_updateBits(IP5306_REG_SYS_CTL0, CHARGER_EN_BIT, false);
                 s_chg_inhibited = true;
                 ESP_LOGW(TAG, "Charging DISABLED — temp %.1f°C outside [%.0f, %.0f]",
                          t, CHG_TEMP_MIN_C, CHG_TEMP_MAX_C);
             } else if (!out_of_range && s_chg_inhibited) {
                 // Re-enable charger
-                uint8_t ctl0;
-                if (ip5306_read_reg(IP5306_REG_SYS_CTL0, &ctl0) == ESP_OK) {
-                    ip5306_write_reg(IP5306_REG_SYS_CTL0, ctl0 | CHARGER_EN_BIT);
-                }
+                ip5306_updateBits(IP5306_REG_SYS_CTL0, CHARGER_EN_BIT, true);
                 s_chg_inhibited = false;
                 ESP_LOGI(TAG, "Charging RE-ENABLED — temp %.1f°C back in range", t);
             }
