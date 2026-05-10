@@ -21,6 +21,7 @@ static const char *TAG = "BAT";
 #define IP5306_REG_SYS_CTL0 0x00U
 #define IP5306_REG_SYS_CTL1 0x01U
 #define IP5306_REG_SYS_CTL2 0x02U
+#define IP5306_REG_SYS_CTL3 0x03U   // bit 6 = long-press time (0 = 2 s, 1 = 3 s)
 #define IP5306_REG_READ0    0x70U   // bit 3 = charging
 #define IP5306_REG_READ1    0x71U   // bit 3 = charge full
 #define IP5306_REG_READ2    0x72U   // bit 5 = light load, bit 0 = low-power shutdown
@@ -51,6 +52,9 @@ static const char *TAG = "BAT";
 #define SYS_CTL1_BIT8      (1U << 7)  // boost control signal
 #define SYS_CTL1_BIT5      (1U << 5)  // short press boost switch
 
+// Bit masks – REG_SYS_CTL3
+#define SYS_CTL3_LONG_PRESS_3S  (1U << 6)  // 0 = 2 s, 1 = 3 s
+
 // Charging current: I_mA = (value × 100) + 50
 // 0.25 A = 250 mA → value = (250 − 50) / 100 = 2
 #define CHG_CURRENT_BITS    0x02U
@@ -73,7 +77,7 @@ static const char *TAG = "BAT";
 
 // ── Charging temperature thresholds (easily modifiable) ────
 #define CHG_TEMP_MIN_C       0.0f    // disable charging below this
-#define CHG_TEMP_MAX_C      33.0f    // disable charging above this
+#define CHG_TEMP_MAX_C      45.0f    // disable charging above this
 
 // ADC channel for GPIO0 on ESP32-C3 → ADC1 channel 0
 #define NTC_ADC_CHANNEL     ADC1_CHANNEL_0
@@ -231,16 +235,69 @@ static void ip5306_set_charge_current(void)
 static void ip5306_configure(void)
 {
     // SYS_CTL0
-    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT5, true);  // enable boost mode
-    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT2, true);  // enable boost output
-    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT3, false); // disable power on load
+    // ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT5, true);  // enable boost mode
+    // ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT2, true);  // enable boost output
+    //ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT3, false); // disable power on load
 
     // SYS_CTL1
     ip5306_updateBits(IP5306_REG_SYS_CTL1, SYS_CTL1_BIT8, false); // disable boost control signal
-    ip5306_updateBits(IP5306_REG_SYS_CTL1, SYS_CTL1_BIT5, true);  // enable short press boost
+    ip5306_updateBits(IP5306_REG_SYS_CTL1, SYS_CTL1_BIT5, false);  // enable short press boost
+
+    // SYS_CTL3 — long-press duration = 3 s (bit 6 = 1)
+    ip5306_updateBits(IP5306_REG_SYS_CTL3, SYS_CTL3_LONG_PRESS_3S, true);
 
     // Set charging current to 0.25 A
     ip5306_set_charge_current();
+}
+
+// ── Power control ──────────────────────────────────────────
+
+static void ip5306_clear_key_latches(void)
+{
+    uint8_t key = 0;
+    if (ip5306_read_reg(IP5306_REG_KEY, &key) == ESP_OK && (key & 0x07)) {
+        ip5306_write_reg(IP5306_REG_KEY, key & 0x07);
+    }
+}
+
+void battery_power_off(void)
+{
+    ESP_LOGW(TAG, ">>> Powering OFF: clearing IP5306 BOOST_EN <<<");
+    // Drop boost → 5V rail collapses → ESP loses power.
+    ip5306_updateBits(IP5306_REG_SYS_CTL0, SYS_CTL0_BIT5, false);
+    // Should not return; if rail decays slowly, hang here.
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+bool battery_power_on_confirm(uint32_t timeout_ms)
+{
+    ESP_LOGI(TAG, "Awaiting long-press confirmation (timeout %lu ms)...",
+             (unsigned long)timeout_ms);
+
+    // Discard any latched events from the wake-up press.
+    ip5306_clear_key_latches();
+
+    const TickType_t poll = pdMS_TO_TICKS(50);
+    const int64_t    deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+
+    while (esp_timer_get_time() < deadline_us) {
+        uint8_t key = 0;
+        if (ip5306_read_reg(IP5306_REG_KEY, &key) == ESP_OK) {
+            if (key & KEY_LONG_PRESS_BIT) {
+                // Clear all latched key bits
+                ip5306_write_reg(IP5306_REG_KEY, key & 0x07);
+                ESP_LOGI(TAG, "Power-on confirmed by long-press");
+                return true;
+            }
+        }
+        vTaskDelay(poll);
+    }
+
+    ESP_LOGW(TAG, "No long-press within window — shutting down");
+    battery_power_off();   // does not return
+    return false;          // unreachable
 }
 
 // ── ADC initialisation ─────────────────────────────────────
@@ -287,7 +344,10 @@ static void battery_task(void *arg)
             }
             if (key & KEY_LONG_PRESS_BIT) {
                 s_key_long = true;
-                ESP_LOGI(TAG, "Power button LONG press detected");
+                ESP_LOGI(TAG, "Power button LONG press detected — powering off");
+                // Clear the latched bits before shutting down
+                ip5306_write_reg(IP5306_REG_KEY, key & 0x07);
+                battery_power_off();   // does not return
             }
             if (key & KEY_DOUBLE_CLICK_BIT) {
                 s_key_double = true;
@@ -361,8 +421,13 @@ void battery_service_init(void)
         ip5306_configure();
     }
 
+    ESP_LOGI(TAG, "Battery service initialised (task not yet started)");
+}
+
+void battery_service_start(void)
+{
     xTaskCreate(battery_task, "bat_task", BAT_TASK_STACK, NULL, 1, NULL);
-    ESP_LOGI(TAG, "Battery service started");
+    ESP_LOGI(TAG, "Battery monitor task started");
 }
 
 int8_t battery_get_level(void)

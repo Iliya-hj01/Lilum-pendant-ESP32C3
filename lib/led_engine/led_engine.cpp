@@ -49,6 +49,12 @@ static const uint8_t ZERO_CLAMP = 40;
 static bool g_white_mode = false;
 
 // ---------------------------------------------------------------------------
+// Boot-blink overlay (used during the power-on confirm window)
+// ---------------------------------------------------------------------------
+static bool         g_boot_blink_active   = false;
+#define BOOT_BLINK_PERIOD_MS  400  // full on/off cycle = 400 ms (≈2.5 Hz)
+
+// ---------------------------------------------------------------------------
 // Mapping arrays  (operate on the 27 animation LEDs)
 // ---------------------------------------------------------------------------
 #define NUM_LEDS_MAP1 3
@@ -681,6 +687,16 @@ void led_engine_loop() {
         }
     }
 
+    // Boot-blink overlay: gate the global brightness on/off so the running
+    // animation appears to blink. Applied last so it overrides whatever the
+    // pattern functions set.
+    if (g_boot_blink_active) {
+        bool on = ((now / (BOOT_BLINK_PERIOD_MS / 2)) & 1) == 0;
+        if (!on) {
+            FastLED.setBrightness(0);
+        }
+    }
+
     FastLED.show();
 }
 
@@ -698,4 +714,8 @@ void led_engine_set_white_mode(bool enable) {
 
 bool led_engine_is_white_mode(void) {
     return g_white_mode;
+}
+
+void led_engine_set_boot_blink(bool enable) {
+    g_boot_blink_active = enable;
 }

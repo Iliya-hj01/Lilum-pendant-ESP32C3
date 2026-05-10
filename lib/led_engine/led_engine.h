@@ -25,6 +25,13 @@ void led_engine_set_white_mode(bool enable);
 /// Returns true when white mode is active.
 bool led_engine_is_white_mode(void);
 
+/// Enable a brightness-based blink overlay used during the power-on confirm
+/// window. While enabled, the existing animations still run; only the global
+/// FastLED brightness is gated on/off in a square wave so the visible effect
+/// is the LEDs blinking. Disable when the system has confirmed power-on so
+/// animations are shown at their normal brightness.
+void led_engine_set_boot_blink(bool enable);
+
 #ifdef __cplusplus
 }
 #endif

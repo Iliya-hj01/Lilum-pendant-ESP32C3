@@ -18,8 +18,35 @@ typedef enum {
 /**
  * Initialise the battery service (IP5306 I2C + NTC ADC on GPIO0).
  * Must be called AFTER imu_service_init() so the I2C bus is already up.
+ *
+ * This now ONLY brings up the hardware and configures the IP5306
+ * (including 3 s long-press time). The periodic monitor task is NOT
+ * started here — call battery_service_start() once the boot sequence
+ * has confirmed the user actually wants the system on.
  */
 void battery_service_init(void);
+
+/**
+ * Start the periodic battery monitor task. Call after the power-on
+ * long-press has been confirmed and the rest of the system is up.
+ */
+void battery_service_start(void);
+
+/**
+ * Block waiting for the user to complete a long-press (3 s) on the
+ * IP5306 power key, up to `timeout_ms`. Must be called after
+ * battery_service_init() and before battery_service_start().
+ *
+ * - Returns true once a long-press latch is detected.
+ * - On timeout, calls battery_power_off() and never returns.
+ */
+bool battery_power_on_confirm(uint32_t timeout_ms);
+
+/**
+ * Drop the IP5306 boost rail (BOOST_EN = 0) so the 5 V → 3.3 V chain
+ * collapses and the ESP32-C3 powers down. Does not return.
+ */
+void battery_power_off(void);
 
 /** Battery level in approximate percent (0, 25, 50, 75, 100) or -1 on error. */
 int8_t battery_get_level(void);
